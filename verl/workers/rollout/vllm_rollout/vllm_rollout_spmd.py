@@ -976,3 +976,57 @@ class vLLMMultiturnRollout(BaseRollout):
 
         if current_turns >= self.config.multi_turn.max_assistant_turns:
             finish_reason_type = FinishReasonTypeEnum.STOP
+
+    def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int) -> list[AsyncRolloutRequest]:
+        assert "raw_prompt" in prompts.non_tensor_batch, "need data.return_raw_chat=True, due to no official way do parse_messages"
+        req_list = []
+        multi_modal_data_list = prompts.non_tensor_batch.get("multi_modal_data", [None] * len(prompts.non_tensor_batch["raw_prompt"]))
+        for data_idx, (raw_prompt, multi_modal_data) in enumerate(zip(prompts.non_tensor_batch["raw_prompt"], multi_modal_data_list)):
+            for rollout_offset in range(n):
+                if self._tool_schemas:
+                    _tools_kwargs = prompts.non_tensor_batch["tools_kwargs"][data_idx]
+                    _tool_schemas = [self._tool_map[k].get_openai_tool_schema() for k in _tools_kwargs.keys()]
+                    _input_ids = None
+                    _attention_mask = None
+                else:
+                    _input_ids = _pre_process_inputs(self.pad_token_id, prompts.batch["input_ids"][data_idx])
+                    _attention_mask = _pre_process_inputs(0, prompts.batch["attention_mask"][data_idx])
+                    _tools_kwargs = {}
+                    _tool_schemas = None
+
+                if self.interaction is not None:
+                    _interaction_kwargs = prompts.non_tensor_batch["interaction_kwargs"][data_idx]
+                else:
+                    _interaction_kwargs = {}
+
+                req = AsyncRolloutRequest(
+                    batch_data_id=data_idx,
+                    rollout_offset=rollout_offset,
+                    request_id=str(uuid4()),
+                    state=AsyncRolloutRequestStateEnum.PENDING,
+                    messages=raw_prompt.tolist(),
+                    multi_modal_data=multi_modal_data,
+                    tool_schemas=_tool_schemas,
+                    tools_kwargs=_tools_kwargs,
+                    interaction_kwargs=_interaction_kwargs,
+                    input_ids=_input_ids,
+                    response_ids=[],
+                    attention_mask=_attention_mask,
+                    response_attention_mask=[],
+                    response_position_ids=[],
+                    response_loss_mask=[],
+                    reward_scores={},
+                    max_prompt_len=self.config.prompt_length,
+                    max_response_len=self.config.response_length,
+                    max_model_len=min(self.config.max_model_len, self.config.prompt_length + self.config.response_length),
+                    use_inference_chat_template=self.config.multi_turn.use_inference_chat_template,
+                    tokenization_sanity_check_mode=self.config.multi_turn.tokenization_sanity_check_mode,
+                    processing_class=self.processing_class,
+                )
+
+                error_message = f"Request {req.request_id} has mismatched lengths: input_ids={len(req.input_ids)}, attention_mask={len(req.attention_mask)}, position_ids={len(req.position_ids)}, loss_mask={len(req.loss_mask)}"
+                assert len(req.input_ids) == len(req.attention_mask) == len(req.position_ids) == len(req.loss_mask), error_message
+
+                req_list.append(req)
+
+        return req_list 
