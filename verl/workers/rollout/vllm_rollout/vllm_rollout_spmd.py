@@ -533,7 +533,7 @@ class vLLMMultiturnRollout(BaseRollout):
             **lora_kwargs,
             **engine_kwargs,
         )
-        self.engine_client = AsyncLLMEngine.from_engine_args(engine_args)
+        self.inference_engine = AsyncLLMEngine.from_engine_args(engine_args)
 
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
