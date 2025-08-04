@@ -180,7 +180,7 @@ class vLLMRollout(BaseRollout):
         self.pad_token_id = tokenizer.pad_token_id
 
     def _init_distributed_env(self, device_mesh_cpu):
-        tp_size = self.tensor_parallel_size
+        tp_size = self._tp_size
         world_size = int(os.getenv("WORLD_SIZE", "-1"))
 
         # init device mesh
@@ -193,10 +193,9 @@ class vLLMRollout(BaseRollout):
             self._device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
         
         self._rank = self._device_mesh_cpu.get_rank()
-        self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
-        self._tp_size = self._device_mesh_cpu["tp"].size()
+        
         if self._rank == 0:
-            logger.info(f"_init_distributed_env: :tp_world: {self._tp_size}, global_world: {world_size}")
+            logger.info(f"_init_distributed_env: :tp_world: {tp_size}, global_world: {world_size}")
         # get tp_rank of this process in this tp group
         visible_devices = [None] * self._device_mesh_cpu.size(1)
 
@@ -214,7 +213,7 @@ class vLLMRollout(BaseRollout):
             self.inference_engine = LLM(
                 model=model_path,
                 enable_sleep_mode=True,
-                tensor_parallel_size=self.tensor_parallel_size,
+                tensor_parallel_size=self._tp_size,
                 distributed_executor_backend="external_launcher",
                 dtype=self.config.dtype,
                 enforce_eager=self.config.enforce_eager,
@@ -236,17 +235,7 @@ class vLLMRollout(BaseRollout):
             # prepare the device mesh for multi-turn rollout
             self._rank = self._device_mesh_cpu.get_rank()
             self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
-            self._tp_size = self._device_mesh_cpu["tp"].size()
-            if self._rank == 0:
-                logger.info(f"_init_distributed_env: :tp_world: {self._tp_size}, global_world: {world_size}")
-            # get tp_rank of this process in this tp group
-            visible_devices = [None] * self._device_mesh_cpu.size(1)
 
-            torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._device_mesh_cpu.get_group("tp"))
-            self.visible_devices_set = set(",".join(visible_devices).split(","))
-            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
-
-            # initialize the inference engine
             nnodes = -(-self._tp_size // len(self.visible_devices_set))
             # # TODO: get_ip(), get_open_port(), broadcast_pyobj() are not defined in this file.
             # if nnodes > 1:
@@ -273,7 +262,7 @@ class vLLMRollout(BaseRollout):
                 self.inference_engine = LLM(
                     model=model_path,
                     enable_sleep_mode=True,
-                    tensor_parallel_size=self.tensor_parallel_size,
+                    tensor_parallel_size=self._tp_size,
                     distributed_executor_backend="external_launcher",
                     dtype=self.config.dtype,
                     enforce_eager=self.config.enforce_eager,
