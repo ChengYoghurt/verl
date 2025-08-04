@@ -259,7 +259,7 @@ class vLLMRollout(BaseRollout):
             if first_rank_in_node:
                 rank = dist.get_rank()
                 os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-                self.inference_engine = LLM(
+                self.inference_engine = AsyncLLM(
                     model=model_path,
                     enable_sleep_mode=True,
                     tensor_parallel_size=self._tp_size,
