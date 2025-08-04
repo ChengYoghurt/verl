@@ -562,442 +562,6 @@ class vLLMRollout(BaseRollout):
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
 
-
-class vLLMAsyncRollout:
-    """vLLMAsyncRollout is a thin wrapper of WorkerWrapperBase,
-    which is engine in single worker process.
-    """
-
-    def __init__(self, *args, **kwargs):
-        # Engine is deferred to be initialized in init_worker
-        self.inference_engine: WorkerWrapperBase = None
-        self.sharding_manager = None
-        self.is_sleep = False
-
-    def init_worker(self, all_kwargs: List[Dict[str, Any]]):
-        """Initialize worker engine."""
-        all_kwargs[0]["rank"] = int(os.environ["RANK"])
-        all_kwargs[0]["local_rank"] = 0
-
-        self.vllm_config = all_kwargs[0]["vllm_config"]
-        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
-        self.inference_engine.init_worker(all_kwargs)
-
-    def load_model(self, *args, **kwargs):
-        self.inference_engine.load_model(*args, **kwargs)
-
-        # inference engine is initialized now, update sharding manager
-        self.sharding_manager.inference_engine = self.inference_engine
-        self.sharding_manager.model_runner = self.inference_engine.worker.model_runner
-
-    def sleep(self, *args, **kwargs):
-        """Offload model weights and discard kv cache."""
-        if self.is_sleep:
-            return
-        self.sharding_manager.__exit__(None, None, None)
-        self.is_sleep = True
-
-    def wake_up(self, *args, **kwargs):
-        """Load model weights and build kv cache."""
-        if not self.is_sleep:
-            return
-        self.sharding_manager.__enter__()  # pylint: disable=C2801
-        self.is_sleep = False
-
-    def execute_method(self, method: Union[str, bytes], *args, **kwargs):
-        if method == "init_worker":
-            return self.init_worker(*args, **kwargs)
-        elif method == "load_model":
-            return self.load_model(*args, **kwargs)
-        elif method == "sleep":
-            return self.sleep(*args, **kwargs)
-        elif method == "wake_up":
-            return self.wake_up(*args, **kwargs)
-        else:
-            return self.inference_engine.execute_method(method, *args, **kwargs)
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, **kwargs):
-        """A vLLM rollout. It requires the module is supported by the vllm.
-
-        Args:
-            module: module here follows huggingface APIs
-            config: DictConfig
-            tokenizer: the task/model tokenizer
-            model_hf_config: the huggingface config to initiallize the generating model in vllm
-            **kwargs: train_tp, for Megatron Backend to initialize hybrid engine (zero redundancy) process group
-        """
-        super().__init__()
-        self.config = config
-
-        (
-            self._tool_schemas,
-            self._tool_map,
-            self._tool_call_parser_type,
-            self._sgl_tools,
-            self._function_call_parser, # TODO
-        ) = self._initialize_tools(config, processing_class)
-        self.interaction: dict[str, BaseInteraction] = self._intitalize_interaction(config)
-
-        assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
-
-        tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
-        assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
-        max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
-
-        if kwargs.get("train_tp") is not None:
-            # deployed with megatron
-            import os
-
-            os.environ["CUDA_TIMER_STREAM_KAFKA_ENABLE"] = "0"
-            os.environ["MEGATRON_IMPORT_TIMERS"] = "0"
-            if vllm_version in (
-                "0.5.4",
-                "0.6.3",
-            ):
-                train_tp = kwargs.get("train_tp")
-                num_tp_per_train_tp = train_tp // tensor_parallel_size
-                vllm_ps.initialize_parallel_state(tensor_model_parallel_size=tensor_parallel_size, num_tp_per_train_tp=num_tp_per_train_tp)
-            else:
-                vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
-
-        rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
-        if not rope_scaling_config:
-            max_position_embeddings = None
-            if hasattr(model_hf_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.max_position_embeddings
-            elif hasattr(model_hf_config, "llm_config") and hasattr(model_hf_config.llm_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.llm_config.max_position_embeddings
-            elif hasattr(model_hf_config, "text_config") and hasattr(model_hf_config.text_config, "max_position_embeddings"):
-                max_position_embeddings = model_hf_config.text_config.max_position_embeddings
-            if max_position_embeddings is None:
-                raise ValueError("max_position_embeddings not found in model_hf_config")
-
-            assert max_position_embeddings >= config.prompt_length + config.response_length, "model context length should be greater than total sequence length"
-
-        max_model_len = int(config.max_model_len or config.prompt_length + config.response_length)
-
-        if max_num_batched_tokens < max_model_len and self.config.enable_chunked_prefill:
-            raise ValueError(
-                "Enable chunked prefill, max_num_batched_tokens is smaller than max_model_len, \
-                             please increase max_num_batched_tokens or disable chunked prefill"
-            )
-
-        trust_remote_code = kwargs.get("trust_remote_code", False)
-        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
-
-        lora_kwargs = kwargs.pop("lora_kwargs", {})
-        self.lora_kwargs = lora_kwargs
-        # copy it to avoid secretly modifying the engine config
-        engine_kwargs = {} if "engine_kwargs" not in config or "vllm" not in config.engine_kwargs else OmegaConf.to_container(deepcopy(config.engine_kwargs.vllm))
-        # For each vLLM engine parameter,
-        # - `None` means not setting it, so we pop it, and leave it to vLLM default value
-        #    (which can vary across different vLLM versions);
-        # - Otherwise it's the desired value we want to explicitly set.
-        engine_kwargs = {key: val for key, val in engine_kwargs.items() if val is not None}
-        if config.get("limit_images", None):  # support for multi-image data
-            engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
-
-        # Initialize vllm async engine
-        engine_args = AsyncEngineArgs(
-            model=model_path,
-            enable_sleep_mode=True,
-            tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend="external_launcher",
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            disable_custom_all_reduce=True,
-            skip_tokenizer_init=False,
-            max_model_len=max_model_len,
-            load_format=load_format,
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
-            trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
-            **lora_kwargs,
-            **engine_kwargs,
-        )
-        self.inference_engine = AsyncLLMEngine.from_engine_args(engine_args)
-
-        # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
-
-        kwargs = dict(
-            n=1,
-            logprobs=0,  # can be set to 0 and let actor to recompute
-            max_tokens=config.response_length,
-        )
-
-        # # we may detokenize the result all together later
-        if vllm_version != "0.3.1":
-            kwargs["detokenize"] = False
-
-        # supporting adding any sampling params from the config file
-        for k in config.keys():
-            if hasattr(SamplingParams(), str(k)):
-                kwargs[k] = config.get(k)
-
-        print(f"kwargs: {kwargs}")
-        self.sampling_params = SamplingParams(**kwargs)
-
-        self.processing_class = processing_class
-
-        self.pad_token_id = tokenizer.pad_token_id
-
-    def _initialize_tools(self, config, processing_class):
-        """Initialize tools from configuration.
-
-        Args:
-            config: Configuration object containing tool-related settings,
-                    specifically `config.multi_turn.tool_config_path`.
-            tokenizer: The tokenizer instance used for parsing tool calls from
-                       the model's generated text.
-
-        Returns:
-            tuple: A tuple containing:
-                - tool_schemas (list[dict]): OpenAI-formatted JSON schemas
-                  defining each tool's capabilities.
-                - tool_map (dict[str, BaseTool]): A dictionary mapping tool
-                  names to their executable `BaseTool` objects.
-                - tool_call_parser_type (str): The identifier for the specific
-                  parser type (e.g., 'json_mode', 'tool_code') used to extract
-                  tool calls.
-                - vllm_tools: Tool # (sglang - list[sglang.srt.openai_api.protocol.Tool]) # TODO
-                  definitions optimized for vllm's internal engine.
-                - function_call_parser # (vllm - vllm.entrypoints.openai.tool_parsers):
-                  The active parser instance responsible for extracting
-                  structured tool calls from model outputs.
-        """
-        if config.multi_turn.tool_config_path is None:
-            return [], {}, None, [], None
-
-        tools_config_file = config.multi_turn.tool_config_path
-        tool_list = initialize_tools_from_config(tools_config_file)
-
-        logger.info(f"Initialize tools from configuration.: tool_list: {tool_list}")
-        tool_schemas = [tool.get_openai_tool_schema().model_dump() for tool in tool_list]
-        tool_map = {tool.name: tool for tool in tool_list}
-        tool_call_parser_type = get_tool_call_parser_type(processing_class)
-        vllm_tools = [Tool.model_validate(tool_schema) for tool_schema in tool_schemas]
-        
-        # TODO: function_call_parser
-        '''
-        function_call_parser = FunctionCallParser(
-            vllm_tools,
-            tool_call_parser_type,
-        )
-
-        return (
-            tool_schemas,
-            tool_map,
-            tool_call_parser_type,
-            vllm_tools,
-            function_call_parser,
-        )
-        '''
-
-    def _intitalize_interaction(self, config):
-        import importlib.util
-        import sys
-
-        from omegaconf import OmegaConf
-
-        if config.multi_turn.interaction_config_path is None:
-            return None
-        interaction_config_file = config.multi_turn.interaction_config_path
-        interaction_config = OmegaConf.load(interaction_config_file).interaction[0]
-        cls_name = interaction_config.class_name
-        module_name, class_name = cls_name.rsplit(".", 1)
-        if module_name not in sys.modules:
-            spec = importlib.util.find_spec(module_name)
-            module = importlib.util.module_from_spec(spec)
-            sys.modules[module_name] = module
-            spec.loader.exec_module(module)
-        else:
-            module = sys.modules[module_name]
-
-        interaction_cls = getattr(module, class_name)
-
-        interaction = interaction_cls(config=OmegaConf.to_container(interaction_config.config, resolve=True))
-        return interaction
-
-    @contextmanager
-    def update_sampling_params(self, **kwargs):
-        # update sampling params
-        old_sampling_params_args = {}
-        if kwargs:
-            for key, value in kwargs.items():
-                if hasattr(self.sampling_params, key):
-                    old_value = getattr(self.sampling_params, key)
-                    old_sampling_params_args[key] = old_value
-                    setattr(self.sampling_params, key, value)
-        yield
-        # roll back to previous sampling params
-        # if len(old_sampling_params_args):
-        for key, value in old_sampling_params_args.items():
-            setattr(self.sampling_params, key, value)
-
-    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
-    @torch.no_grad()
-    def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        # rebuild vllm cache engine
-        if (
-            vllm_version
-            in (
-                "0.5.4",
-                "0.6.3",
-            )
-            and self.config.free_cache_engine
-        ):
-            self.inference_engine.init_cache_engine()
-
-        idx = prompts.batch["input_ids"]  # (bs, prompt_length)
-        # left-padded attention_mask
-        attention_mask = prompts.batch["attention_mask"]
-        position_ids = prompts.batch["position_ids"]
-
-        # used to construct attention_mask
-        eos_token_id = prompts.meta_info["eos_token_id"]
-
-        batch_size = idx.size(0)
-
-        non_tensor_batch = prompts.non_tensor_batch
-        if "raw_prompt_ids" not in non_tensor_batch:
-            non_tensor_batch["raw_prompt_ids"] = np.array([_pre_process_inputs(self.pad_token_id, idx[i]) for i in range(batch_size)], dtype=object)
-
-        if batch_size != len(non_tensor_batch["raw_prompt_ids"]):
-            raise RuntimeError("vllm sharding manager is not work properly.")
-
-        if "multi_modal_data" in non_tensor_batch:
-            vllm_inputs = []
-            for raw_prompt_ids, multi_modal_data in zip(non_tensor_batch.pop("raw_prompt_ids"), non_tensor_batch.pop("multi_modal_data")):
-                vllm_inputs.append({"prompt_token_ids": raw_prompt_ids, "multi_modal_data": multi_modal_data})
-        else:
-            vllm_inputs = [{"prompt_token_ids": raw_prompt_ids} for raw_prompt_ids in non_tensor_batch.pop("raw_prompt_ids")]
-
-        # ensure the type of `prompt_token_ids` passed to vllm is list[int]
-        # https://github.com/volcengine/verl/pull/772
-        for input_data in vllm_inputs:
-            if isinstance(input_data["prompt_token_ids"], np.ndarray):
-                input_data["prompt_token_ids"] = input_data["prompt_token_ids"].tolist()
-            elif not isinstance(input_data["prompt_token_ids"], list):
-                raise TypeError(f"prompt_token_ids must be a list or numpy array, got {type(input_data['prompt_token_ids'])}")
-
-        do_sample = prompts.meta_info.get("do_sample", True)
-        is_validate = prompts.meta_info.get("validate", False)
-        if not do_sample:
-            kwargs = {
-                "best_of": 1,
-                "top_p": 1.0,
-                "top_k": -1,
-                "min_p": 0.0,
-                "temperature": 0,
-                "n": 1,  # if greedy, only 1 response
-            }
-        elif is_validate:
-            # TODO: try **
-            kwargs = {
-                "top_k": self.config.val_kwargs.top_k,
-                "top_p": self.config.val_kwargs.top_p,
-                "temperature": self.config.val_kwargs.temperature,
-                "n": 1,  # if validate, already repeat in ray_trainer
-            }
-
-        lora_requests = None
-        if self.lora_kwargs:
-            lora_int_ids = list(self.inference_engine.llm_engine.list_loras())
-            if len(lora_int_ids) > 0:
-                lora_int_id = lora_int_ids[0]
-                lora_requests = [LoRARequest(lora_name=f"{lora_int_id}", lora_int_id=lora_int_id, lora_path="/simon-stub-path")] * batch_size
-
-        # users can customize different sampling_params at different run
-        with self.update_sampling_params(**kwargs):
-            outputs = self.inference_engine.generate(
-                prompts=vllm_inputs,  # because we have already convert it to prompt token id
-                sampling_params=self.sampling_params,
-                lora_request=lora_requests,
-                use_tqdm=False,
-            )
-
-            # TODO(sgm): disable logprob when recompute_log_prob is enable
-            # if n = 1: (bs, response_length) ; if n > 1: (bs * n, response_length)
-
-            response = []
-            rollout_log_probs = []
-            for output in outputs:
-                for sample_id in range(len(output.outputs)):
-                    response_ids = output.outputs[sample_id].token_ids
-                    response.append(response_ids)
-                    if self.config.calculate_log_probs:
-                        curr_log_prob = []
-                        for i, logprob in enumerate(output.outputs[sample_id].logprobs):
-                            curr_log_prob.append(logprob[response_ids[i]].logprob)
-                        rollout_log_probs.append(curr_log_prob)
-
-            response = pad_2d_list_to_length(response, self.pad_token_id, max_length=self.config.response_length).to(idx.device)
-            if self.config.calculate_log_probs:
-                rollout_log_probs = pad_2d_list_to_length(rollout_log_probs, -1, max_length=self.config.response_length).to(idx.device)
-                rollout_log_probs = rollout_log_probs.to(torch.float32)
-
-            if self.sampling_params.n > 1 and do_sample:
-                idx = _repeat_interleave(idx, self.sampling_params.n)
-                attention_mask = _repeat_interleave(attention_mask, self.sampling_params.n)
-                position_ids = _repeat_interleave(position_ids, self.sampling_params.n)
-                batch_size = batch_size * self.sampling_params.n
-                # NOTE(linjunrong): for multi-turn https://github.com/volcengine/verl/pull/1037
-                if "tools_kwargs" in non_tensor_batch.keys():
-                    non_tensor_batch["tools_kwargs"] = _repeat_interleave(non_tensor_batch["tools_kwargs"], self.sampling_params.n)
-                if "interaction_kwargs" in non_tensor_batch.keys():
-                    non_tensor_batch["interaction_kwargs"] = _repeat_interleave(non_tensor_batch["interaction_kwargs"], self.sampling_params.n)
-                if "raw_prompt" in non_tensor_batch.keys():
-                    non_tensor_batch["raw_prompt"] = _repeat_interleave(non_tensor_batch["raw_prompt"], self.sampling_params.n)
-
-            seq = torch.cat([idx, response], dim=-1)
-
-        response_length = response.size(1)
-        delta_position_id = torch.arange(1, response_length + 1, device=position_ids.device)
-        delta_position_id = delta_position_id.unsqueeze(0).expand(batch_size, -1)
-        if position_ids.dim() == 3:  # qwen2vl mrope
-            delta_position_id = delta_position_id.view(batch_size, 1, -1).expand(batch_size, 3, -1)
-
-        # TODO(sgm): fix position_ids on right_pad
-        # prompt: left pad + response: right pad
-        # attention_mask: [0,0,0,0,1,1,1,1, | 1,1,1,0,0,0,0,0]
-        # position_ids:   [0,0,0,0,0,1,2,3, | 4,5,6,7,8,9,10,11]
-        response_position_ids = position_ids[..., -1:] + delta_position_id
-        position_ids = torch.cat([position_ids, response_position_ids], dim=-1)
-        response_attention_mask = get_response_mask(response_id=response, eos_token=eos_token_id, dtype=attention_mask.dtype)
-        attention_mask = torch.cat((attention_mask, response_attention_mask), dim=-1)
-
-        # all the tp ranks should contain the same data here. data in all ranks are valid
-        batch = TensorDict(
-            {
-                "prompts": idx,
-                "responses": response,
-                "input_ids": seq,  # here input_ids become the whole sentences
-                "attention_mask": attention_mask,
-                "position_ids": position_ids,
-            },
-            batch_size=batch_size,
-        )
-        if self.config.calculate_log_probs:
-            # we will recompute old log prob with actor
-            batch["rollout_log_probs"] = rollout_log_probs
-
-        # free vllm cache engine
-        if (
-            vllm_version
-            in (
-                "0.5.4",
-                "0.6.3",
-            )
-            and self.config.free_cache_engine
-        ):
-            self.inference_engine.free_cache_engine()
-
-        return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
@@ -1214,4 +778,57 @@ class vLLMAsyncRollout:
 
                 req_list.append(req)
 
-        return req_list 
+        return req_list
+
+class vLLMAsyncRollout:
+    """vLLMAsyncRollout is a thin wrapper of WorkerWrapperBase,
+    which is engine in single worker process.
+    """
+
+    def __init__(self, *args, **kwargs):
+        # Engine is deferred to be initialized in init_worker
+        self.inference_engine: WorkerWrapperBase = None
+        self.sharding_manager = None
+        self.is_sleep = False
+
+    def init_worker(self, all_kwargs: List[Dict[str, Any]]):
+        """Initialize worker engine."""
+        all_kwargs[0]["rank"] = int(os.environ["RANK"])
+        all_kwargs[0]["local_rank"] = 0
+
+        self.vllm_config = all_kwargs[0]["vllm_config"]
+        self.inference_engine = WorkerWrapperBase(vllm_config=self.vllm_config)
+        self.inference_engine.init_worker(all_kwargs)
+
+    def load_model(self, *args, **kwargs):
+        self.inference_engine.load_model(*args, **kwargs)
+
+        # inference engine is initialized now, update sharding manager
+        self.sharding_manager.inference_engine = self.inference_engine
+        self.sharding_manager.model_runner = self.inference_engine.worker.model_runner
+
+    def sleep(self, *args, **kwargs):
+        """Offload model weights and discard kv cache."""
+        if self.is_sleep:
+            return
+        self.sharding_manager.__exit__(None, None, None)
+        self.is_sleep = True
+
+    def wake_up(self, *args, **kwargs):
+        """Load model weights and build kv cache."""
+        if not self.is_sleep:
+            return
+        self.sharding_manager.__enter__()  # pylint: disable=C2801
+        self.is_sleep = False
+
+    def execute_method(self, method: Union[str, bytes], *args, **kwargs):
+        if method == "init_worker":
+            return self.init_worker(*args, **kwargs)
+        elif method == "load_model":
+            return self.load_model(*args, **kwargs)
+        elif method == "sleep":
+            return self.sleep(*args, **kwargs)
+        elif method == "wake_up":
+            return self.wake_up(*args, **kwargs)
+        else:
+            return self.inference_engine.execute_method(method, *args, **kwargs)
