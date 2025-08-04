@@ -55,6 +55,9 @@ from verl.workers.rollout.schemas import (
     FinishReasonTypeEnum,
     Message,
 )
+from verl.interactions.base import BaseInteraction
+from verl.tools.base_tool import BaseTool
+from verl.tools.utils.tool_registry import initialize_tools_from_config
 
 logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
@@ -96,6 +99,15 @@ class vLLMRollout(BaseRollout):
         super().__init__()
         self.config = config
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
+
+        (
+            self._tool_schemas,
+            self._tool_map,
+            self._tool_call_parser_type,
+            self._sgl_tools,
+            self._function_call_parser, # TODO
+        ) = self._initialize_tools(config, tokenizer) # pass tokenizer as processing_class
+        self.interaction: dict[str, BaseInteraction] = self._intitalize_interaction(config)
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
@@ -198,6 +210,83 @@ class vLLMRollout(BaseRollout):
         self.sampling_params = SamplingParams(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+
+    def _initialize_tools(self, config, processing_class):
+        """Initialize tools from configuration.
+
+        Args:
+            config: Configuration object containing tool-related settings,
+                    specifically `config.multi_turn.tool_config_path`.
+            tokenizer: The tokenizer instance used for parsing tool calls from
+                       the model's generated text.
+
+        Returns:
+            tuple: A tuple containing:
+                - tool_schemas (list[dict]): OpenAI-formatted JSON schemas
+                  defining each tool's capabilities.
+                - tool_map (dict[str, BaseTool]): A dictionary mapping tool
+                  names to their executable `BaseTool` objects.
+                - tool_call_parser_type (str): The identifier for the specific
+                  parser type (e.g., 'json_mode', 'tool_code') used to extract
+                  tool calls.
+                - vllm_tools: Tool # TODO
+                  definitions optimized for vllm's internal engine.
+                - function_call_parser # (vllm - vllm.entrypoints.openai.tool_parsers): # TODO
+                  The active parser instance responsible for extracting
+                  structured tool calls from model outputs.
+        """
+        if config.multi_turn.tool_config_path is None:
+            return [], {}, None, [], None
+
+        tools_config_file = config.multi_turn.tool_config_path
+        tool_list = initialize_tools_from_config(tools_config_file)
+
+        logger.info(f"Initialize tools from configuration.: tool_list: {tool_list}")
+        tool_schemas = [tool.get_openai_tool_schema().model_dump() for tool in tool_list]
+        tool_map = {tool.name: tool for tool in tool_list}
+        tool_call_parser_type = get_tool_call_parser_type(processing_class)
+        vllm_tools = [Tool.model_validate(tool_schema) for tool_schema in tool_schemas]
+        
+        # TODO: function_call_parser
+        '''
+        function_call_parser = FunctionCallParser(
+            vllm_tools,
+            tool_call_parser_type,
+        )
+
+        return (
+            tool_schemas,
+            tool_map,
+            tool_call_parser_type,
+            vllm_tools,
+            function_call_parser,
+        )
+        '''
+
+    def _intitalize_interaction(self, config):
+        import importlib.util
+        import sys
+
+        from omegaconf import OmegaConf
+
+        if config.multi_turn.interaction_config_path is None:
+            return None
+        interaction_config_file = config.multi_turn.interaction_config_path
+        interaction_config = OmegaConf.load(interaction_config_file).interaction[0]
+        cls_name = interaction_config.class_name
+        module_name, class_name = cls_name.rsplit(".", 1)
+        if module_name not in sys.modules:
+            spec = importlib.util.find_spec(module_name)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[module_name] = module
+            spec.loader.exec_module(module)
+        else:
+            module = sys.modules[module_name]
+
+        interaction_cls = getattr(module, class_name)
+
+        interaction = interaction_cls(config=OmegaConf.to_container(interaction_config.config, resolve=True))
+        return interaction
 
     @contextmanager
     def update_sampling_params(self, **kwargs):
