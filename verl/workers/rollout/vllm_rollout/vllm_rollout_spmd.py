@@ -173,7 +173,7 @@ class vLLMRollout(BaseRollout):
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
         is_multi_turn = config.actor_rollout_ref.rollout.multi_turn.enable if hasattr(config, "actor_rollout_ref") and hasattr(config.actor_rollout_ref, "rollout") else False
-        self._init_inference_engine(is_multi_turn, trust_remote_code, model_path, lora_kwargs, engine_kwargs, port)
+        self._init_inference_engine(is_multi_turn, trust_remote_code, model_path, **lora_kwargs, **engine_kwargs, port)
 
         self._init_sampling_params(**kwargs)
 
@@ -405,6 +405,13 @@ class vLLMRollout(BaseRollout):
     @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        if self.config.multi_turn.enable:
+            return self._req_level_generate_sequences(prompts, **kwargs)
+        return self._batch_level_generate_sequences(prompts, **kwargs)
+
+    @GPUMemoryLogger(role="vllm rollout spmd", logger=logger)
+    @torch.no_grad()
+    def _batch_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
         # rebuild vllm cache engine
         if (
             vllm_version
@@ -561,7 +568,7 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.free_cache_engine()
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-
+        
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
