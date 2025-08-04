@@ -568,7 +568,39 @@ class vLLMRollout(BaseRollout):
             self.inference_engine.free_cache_engine()
 
         return DataProto(batch=batch, non_tensor_batch=non_tensor_batch)
-        
+
+    def _req_level_generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
+        # rebuild vllm cache engine
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+        ):
+            self.inference_engine.init_cache_engine()
+
+        # Async rollout with tools support
+        do_sample = prompts.meta_info.get("do_sample", True)
+        is_validate = prompts.meta_info.get("validate", False)
+        tgt_device = prompts.batch["input_ids"].device
+
+        if self._tp_rank == 0:
+            req_list = self._preprocess_prompt_to_async_rollout_requests(
+                prompts,
+                n=1 if is_validate else self.config.n, # TODO
+            )
+            loop = asyncio.get_event_loop()
+            output_req_list = loop.run_until_complete(
+                asyncio.gather(
+                    *[self._async_rollout_a_request(req, do_sample, is_validate, **kwargs) for req in req_list],
+                )
+            )
+            sorted_output_req_list = sorted(output_req_list, key=lambda x: (x.batch_data_id, x.rollout_offset))
+        else:
+            sorted_output_req_list = None
+
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
