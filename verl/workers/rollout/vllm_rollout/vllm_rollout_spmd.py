@@ -191,6 +191,11 @@ class vLLMRollout(BaseRollout):
         # Offload vllm model to reduce peak memory usage
         self.inference_engine.sleep(level=1)
 
+        self._init_sampling_params(**kwargs)
+
+        self.pad_token_id = tokenizer.pad_token_id
+
+    def _init_sampling_params(self, **kwargs):
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
@@ -208,8 +213,6 @@ class vLLMRollout(BaseRollout):
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
-
-        self.pad_token_id = tokenizer.pad_token_id
 
     def _initialize_tools(self, config, processing_class):
         """Initialize tools from configuration.
