@@ -41,7 +41,8 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
 from vllm.worker.worker_base import WorkerWrapperBase
-from vllm.engine.async_llm_engine import AsyncEngineArgs, AsyncLLMEngine
+from vllm.v1.engine.async_llm import AsyncLLM
+from vllm.engine.arg_utils import AsyncEngineArgs
 
 from verl import DataProto
 from verl.third_party.vllm import vllm_version
