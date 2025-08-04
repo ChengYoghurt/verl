@@ -508,7 +508,7 @@ class SGLangRollout(BaseRollout):
     @GPUMemoryLogger(role="sglang rollout", logger=logger)
     @torch.no_grad()
     def generate_sequences(self, prompts: DataProto, **kwargs) -> DataProto:
-        if self.config.multi_turn.enable:
+        if self.config.:
             return self._req_level_generate_sequences(prompts, **kwargs)
         return self._batch_level_generate_sequences(prompts, **kwargs)
 

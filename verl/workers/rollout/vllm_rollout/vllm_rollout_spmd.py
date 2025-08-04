@@ -37,6 +37,7 @@ import torch
 import torch.distributed
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
+from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
@@ -86,7 +87,7 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
 
 
 class vLLMRollout(BaseRollout):
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, port=None, **kwargs):
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, port=None, device_mesh: DeviceMesh | None = None, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -98,6 +99,7 @@ class vLLMRollout(BaseRollout):
         """
         super().__init__()
         self.config = config
+        self._device_mesh_cpu = device_mesh
         assert not (not config.enforce_eager and config.free_cache_engine), "disable CUDA graph (enforce_eager = False) if free cache engine"
 
         (
@@ -112,6 +114,7 @@ class vLLMRollout(BaseRollout):
         logger.info(f"tool_schemas: {self._tool_schemas}, tool_map: {self._tool_map}, tool_call_parser_type: {self._tool_call_parser_type}, sgl_tools: {self._sgl_tools}, function_call_parser: {self._function_call_parser}")
 
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
+        self.tensor_parallel_size = tensor_parallel_size
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
 
@@ -131,6 +134,8 @@ class vLLMRollout(BaseRollout):
             else:
                 vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
 
+        self._init_distributed_env(device_mesh_cpu=device_mesh)
+        
         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
         if not rope_scaling_config:
             max_position_embeddings = None
@@ -168,7 +173,8 @@ class vLLMRollout(BaseRollout):
         if config.get("limit_images", None):  # support for multi-image data
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
-        self._init_inference_engine(trust_remote_code, model_path, port)
+        is_multi_turn = config.actor_rollout_ref.rollout.multi_turn.enable if hasattr(config, "actor_rollout_ref") and hasattr(config.actor_rollout_ref, "rollout") else False
+        self._init_inference_engine(is_multi_turn, trust_remote_code, model_path, port)
 
         self.inference_engine = LLM(
             model=model_path,
@@ -198,6 +204,105 @@ class vLLMRollout(BaseRollout):
         self._init_sampling_params(**kwargs)
 
         self.pad_token_id = tokenizer.pad_token_id
+
+    def _init_distributed_env(self, device_mesh_cpu):
+        tp_size = self.tensor_parallel_size
+        world_size = int(os.getenv("WORLD_SIZE", "-1"))
+
+        # init device mesh
+        if self._device_mesh_cpu is None:
+            device_mesh_kwargs = dict(
+                mesh_shape=(world_size // tp_size, tp_size, 1),
+                mesh_dim_names=["dp", "tp", "pp"],
+            )
+
+            self._device_mesh_cpu = init_device_mesh("cpu", **device_mesh_kwargs)
+        
+        self._rank = self._device_mesh_cpu.get_rank()
+        self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
+        self._tp_size = self._device_mesh_cpu["tp"].size()
+        if self._rank == 0:
+            logger.info(f"_init_distributed_env: :tp_world: {self._tp_size}, global_world: {world_size}")
+        # get tp_rank of this process in this tp group
+        visible_devices = [None] * self._device_mesh_cpu.size(1)
+
+        torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._device_mesh_cpu.get_group("tp"))
+        self.visible_devices_set = set(",".join(visible_devices).split(","))
+        os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
+
+    def _init_inference_engine(self, is_multi_turn, trust_remote_code, model_path, port):
+        if not is_multi_turn:
+            # todo
+        else:
+            # prepare the device mesh for multi-turn rollout
+            
+
+            self._rank = self._device_mesh_cpu.get_rank()
+            self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
+            self._tp_size = self._device_mesh_cpu["tp"].size()
+            if self._rank == 0:
+                logger.info(f"_init_distributed_env: :tp_world: {self._tp_size}, global_world: {world_size}")
+            # get tp_rank of this process in this tp group
+            visible_devices = [None] * self._device_mesh_cpu.size(1)
+
+            torch.distributed.all_gather_object(visible_devices, os.environ["CUDA_VISIBLE_DEVICES"], self._device_mesh_cpu.get_group("tp"))
+            self.visible_devices_set = set(",".join(visible_devices).split(","))
+            os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
+
+            # initialize the inference engine
+            nnodes = -(-self._tp_size // len(self.visible_devices_set))
+            if nnodes > 1:
+                ip = get_ip()
+                port = get_open_port() if port is None else port
+                [ip, port] = broadcast_pyobj(
+                    [ip, port],
+                    rank=self._rank,
+                    dist_group=self._device_mesh_cpu.get_group("tp"),
+                    src=self._device_mesh_cpu["tp"].mesh[0].item(),
+                    force_cpu_device=False,
+                )
+                dist_init_addr = f"[{ip}]:{port}" if is_ipv6(ip) else f"{ip}:{port}"
+            else:
+                dist_init_addr = None
+
+            load_format = "dummy" if self.config.load_format.startswith("dummy") else self.config.load_format
+            tp_size_per_node = self._tp_size // nnodes
+            node_rank = self._tp_rank // tp_size_per_node
+            first_rank_in_node = self._tp_rank % tp_size_per_node == 0
+
+            if first_rank_in_node:
+                rank = dist.get_rank()
+                os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
+                self._engine = AsyncEngine(
+                    model_path=actor_module,
+                    dtype=self.config.dtype,
+                    mem_fraction_static=self.config.gpu_memory_utilization,
+                    enable_memory_saver=True,
+                    base_gpu_id=0,
+                    gpu_id_step=1,
+                    tp_size=self._tp_size,
+                    node_rank=node_rank,
+                    load_format=load_format,
+                    dist_init_addr=dist_init_addr,
+                    nnodes=nnodes,
+                    trust_remote_code=trust_remote_code,
+                    # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
+                    # when random.seed is being set during training
+                    port=30000 + rank,
+                    # NOTE(Chenyang): if you want to debug the SGLang engine output
+                    # please set the following parameters
+                    # Otherwise, it will make the engine run too slow
+                    # log_level="INFO",
+                    # log_requests=True,
+                    # log_requests_level=2,
+                    # max_running_requests=1,
+                    mm_attention_backend="fa3",
+                )
+            else:
+                self._engine = None
+
+            self.sharding_manager = None
+            self.is_sleep = True
 
     def _init_sampling_params(self, **kwargs):
         kwargs = dict(
