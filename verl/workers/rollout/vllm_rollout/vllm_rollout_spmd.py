@@ -232,9 +232,6 @@ class vLLMRollout(BaseRollout):
                 **lora_kwargs,
                 **engine_kwargs,
             )
-
-            # Offload vllm model to reduce peak memory usage
-            self.inference_engine.sleep(level=1)
         else:
             # prepare the device mesh for multi-turn rollout
             self._rank = self._device_mesh_cpu.get_rank()
@@ -251,21 +248,21 @@ class vLLMRollout(BaseRollout):
 
             # initialize the inference engine
             nnodes = -(-self._tp_size // len(self.visible_devices_set))
-            if nnodes > 1:
-                ip = get_ip()
-                port = get_open_port() if port is None else port
-                [ip, port] = broadcast_pyobj(
-                    [ip, port],
-                    rank=self._rank,
-                    dist_group=self._device_mesh_cpu.get_group("tp"),
-                    src=self._device_mesh_cpu["tp"].mesh[0].item(),
-                    force_cpu_device=False,
-                )
-                dist_init_addr = f"[{ip}]:{port}" if is_ipv6(ip) else f"{ip}:{port}"
-            else:
-                dist_init_addr = None
+            # # TODO: get_ip(), get_open_port(), broadcast_pyobj() are not defined in this file.
+            # if nnodes > 1:
+            #     ip = get_ip()
+            #     port = get_open_port() if port is None else port
+            #     [ip, port] = broadcast_pyobj(
+            #         [ip, port],
+            #         rank=self._rank,
+            #         dist_group=self._device_mesh_cpu.get_group("tp"),
+            #         src=self._device_mesh_cpu["tp"].mesh[0].item(),
+            #         force_cpu_device=False,
+            #     )
+            #     dist_init_addr = f"[{ip}]:{port}" if is_ipv6(ip) else f"{ip}:{port}"
+            # else:
+            #     dist_init_addr = None
 
-            load_format = "dummy" if self.config.load_format.startswith("dummy") else self.config.load_format
             tp_size_per_node = self._tp_size // nnodes
             node_rank = self._tp_rank // tp_size_per_node
             first_rank_in_node = self._tp_rank % tp_size_per_node == 0
@@ -273,36 +270,36 @@ class vLLMRollout(BaseRollout):
             if first_rank_in_node:
                 rank = dist.get_rank()
                 os.environ["SGLANG_BLOCK_NONZERO_RANK_CHILDREN"] = "0"
-                self._engine = AsyncEngine(
-                    model_path=actor_module,
+                self.inference_engine = LLM(
+                    model=model_path,
+                    enable_sleep_mode=True,
+                    tensor_parallel_size=self.tensor_parallel_size,
+                    distributed_executor_backend="external_launcher",
                     dtype=self.config.dtype,
-                    mem_fraction_static=self.config.gpu_memory_utilization,
-                    enable_memory_saver=True,
-                    base_gpu_id=0,
-                    gpu_id_step=1,
-                    tp_size=self._tp_size,
-                    node_rank=node_rank,
+                    enforce_eager=self.config.enforce_eager,
+                    gpu_memory_utilization=self.config.gpu_memory_utilization,
+                    disable_custom_all_reduce=True,
+                    skip_tokenizer_init=False,
+                    max_model_len=max_model_len,
                     load_format=load_format,
-                    dist_init_addr=dist_init_addr,
-                    nnodes=nnodes,
+                    disable_log_stats=self.config.disable_log_stats,
+                    max_num_batched_tokens=max_num_batched_tokens,
+                    enable_chunked_prefill=self.config.enable_chunked_prefill,
+                    enable_prefix_caching=True,
                     trust_remote_code=trust_remote_code,
-                    # NOTE(linjunrong): add rank to prevent SGLang generate same port inside PortArgs.init_new
-                    # when random.seed is being set during training
-                    port=30000 + rank,
-                    # NOTE(Chenyang): if you want to debug the SGLang engine output
-                    # please set the following parameters
-                    # Otherwise, it will make the engine run too slow
-                    # log_level="INFO",
-                    # log_requests=True,
-                    # log_requests_level=2,
-                    # max_running_requests=1,
-                    mm_attention_backend="fa3",
+                    seed=self.config.get("seed", 0),
+                    **lora_kwargs,
+                    **engine_kwargs,
                 )
             else:
-                self._engine = None
+                self.inference_engine = None
 
             self.sharding_manager = None
             self.is_sleep = True
+            
+        if self.inference_engine is not None:
+            # Offload vllm model to reduce peak memory usage
+            self.inference_engine.sleep(level=1)
 
     def _init_sampling_params(self, **kwargs):
         kwargs = dict(
