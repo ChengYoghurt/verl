@@ -135,7 +135,7 @@ class vLLMRollout(BaseRollout):
                 vllm_ps.initialize_model_parallel(tensor_model_parallel_size=tensor_parallel_size)
 
         self._init_distributed_env(device_mesh_cpu=device_mesh)
-        
+
         rope_scaling_config = getattr(model_hf_config, "rope_scaling", None)
         if not rope_scaling_config:
             max_position_embeddings = None
@@ -159,7 +159,6 @@ class vLLMRollout(BaseRollout):
             )
 
         trust_remote_code = kwargs.get("trust_remote_code", False)
-        load_format = "dummy" if config.load_format.startswith("dummy") else config.load_format
 
         lora_kwargs = kwargs.pop("lora_kwargs", {})
         self.lora_kwargs = lora_kwargs
@@ -174,32 +173,7 @@ class vLLMRollout(BaseRollout):
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
         is_multi_turn = config.actor_rollout_ref.rollout.multi_turn.enable if hasattr(config, "actor_rollout_ref") and hasattr(config.actor_rollout_ref, "rollout") else False
-        self._init_inference_engine(is_multi_turn, trust_remote_code, model_path, port)
-
-        self.inference_engine = LLM(
-            model=model_path,
-            enable_sleep_mode=True,
-            tensor_parallel_size=tensor_parallel_size,
-            distributed_executor_backend="external_launcher",
-            dtype=config.dtype,
-            enforce_eager=config.enforce_eager,
-            gpu_memory_utilization=config.gpu_memory_utilization,
-            disable_custom_all_reduce=True,
-            skip_tokenizer_init=False,
-            max_model_len=max_model_len,
-            load_format=load_format,
-            disable_log_stats=config.disable_log_stats,
-            max_num_batched_tokens=max_num_batched_tokens,
-            enable_chunked_prefill=config.enable_chunked_prefill,
-            enable_prefix_caching=True,
-            trust_remote_code=trust_remote_code,
-            seed=config.get("seed", 0),
-            **lora_kwargs,
-            **engine_kwargs,
-        )
-
-        # Offload vllm model to reduce peak memory usage
-        self.inference_engine.sleep(level=1)
+        self._init_inference_engine(is_multi_turn, trust_remote_code, model_path, lora_kwargs, engine_kwargs, port)
 
         self._init_sampling_params(**kwargs)
 
@@ -230,13 +204,39 @@ class vLLMRollout(BaseRollout):
         self.visible_devices_set = set(",".join(visible_devices).split(","))
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
 
-    def _init_inference_engine(self, is_multi_turn, trust_remote_code, model_path, port):
+    def _init_inference_engine(self, is_multi_turn, trust_remote_code, model_path, **lora_kwargs, **engine_kwargs, port):
+        # prepare inference engine args
+        max_model_len = int(self.config.max_model_len or self.config.prompt_length + self.config.response_length)
+        load_format = "dummy" if self.config.load_format.startswith("dummy") else self.config.load_format
+        max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
+        
         if not is_multi_turn:
-            # todo
+            self.inference_engine = LLM(
+                model=model_path,
+                enable_sleep_mode=True,
+                tensor_parallel_size=self.tensor_parallel_size,
+                distributed_executor_backend="external_launcher",
+                dtype=self.config.dtype,
+                enforce_eager=self.config.enforce_eager,
+                gpu_memory_utilization=self.config.gpu_memory_utilization,
+                disable_custom_all_reduce=True,
+                skip_tokenizer_init=False,
+                max_model_len=max_model_len,
+                load_format=load_format,
+                disable_log_stats=self.config.disable_log_stats,
+                max_num_batched_tokens=max_num_batched_tokens,
+                enable_chunked_prefill=self.config.enable_chunked_prefill,
+                enable_prefix_caching=True,
+                trust_remote_code=trust_remote_code,
+                seed=self.config.get("seed", 0),
+                **lora_kwargs,
+                **engine_kwargs,
+            )
+
+            # Offload vllm model to reduce peak memory usage
+            self.inference_engine.sleep(level=1)
         else:
             # prepare the device mesh for multi-turn rollout
-            
-
             self._rank = self._device_mesh_cpu.get_rank()
             self._tp_rank = self._device_mesh_cpu["tp"].get_local_rank()
             self._tp_size = self._device_mesh_cpu["tp"].size()
