@@ -109,6 +109,8 @@ class vLLMRollout(BaseRollout):
         ) = self._initialize_tools(config, tokenizer) # pass tokenizer as processing_class
         self.interaction: dict[str, BaseInteraction] = self._intitalize_interaction(config)
 
+        logger.info(f"tool_schemas: {self._tool_schemas}, tool_map: {self._tool_map}, tool_call_parser_type: {self._tool_call_parser_type}, sgl_tools: {self._sgl_tools}, function_call_parser: {self._function_call_parser}")
+
         tensor_parallel_size = self.config.get("tensor_model_parallel_size", 1)
         assert tensor_parallel_size <= torch.distributed.get_world_size(), "tensor parallel size should be less than or equal to the world size"
         max_num_batched_tokens = self.config.get("max_num_batched_tokens", 8192)
