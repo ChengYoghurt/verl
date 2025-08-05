@@ -778,18 +778,12 @@ class vLLMRollout(BaseRollout):
         if not do_sample:
             update_sampling_params(
                 {
-                    "n": 1,
-                    "presence_penalty": 0.0,
-                    "frequency_penalty": 0.0,
-                    "repetition_penalty": 1.0,
-                    "temperature": 0,
-                    "top_p": 1,
+                    "best_of": 1,
+                    "top_p": 1.0,
                     "top_k": -1,
-                    "ignore_eos": False,
-                    "min_new_tokens": 0,
-                    "max_new_tokens": self.config.response_length,
-                    "skip_special_tokens": True,
-                    "spaces_between_special_tokens": True,
+                    "min_p": 0.0,
+                    "temperature": 0,
+                    "n": 1,  # if greedy, only 1 response                
                 }
             )
         elif is_validate:
