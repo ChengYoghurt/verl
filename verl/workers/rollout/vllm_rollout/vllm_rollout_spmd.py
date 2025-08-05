@@ -714,7 +714,27 @@ class vLLMRollout(BaseRollout):
             batch_size=len(sorted_output_req_list),
         )
 
-        
+        # free vllm cache engine
+        if (
+            vllm_version
+            in (
+                "0.5.4",
+                "0.6.3",
+            )
+            and self.config.free_cache_engine
+            and self.inference_engine is not None
+            and self._tp_rank == 0  # only the master process should free the cache engine
+        ):
+            loop = asyncio.get_event_loop()
+            loop.run_until_complete(self.inference_engine.free_cache_engine())
+
+        return DataProto(
+            batch=batch,
+            non_tensor_batch={
+                "messages": np.array(messages),
+                "reward_scores": np.array(reward_scores),
+            },
+        )
 
     async def _async_rollout_a_request(
         self,
