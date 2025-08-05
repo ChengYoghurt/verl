@@ -579,6 +579,8 @@ class vLLMRollout(BaseRollout):
                 "0.6.3",
             )
             and self.config.free_cache_engine
+            and self.inference_engine is not None
+            and self._tp_rank == 0
         ):
             self.inference_engine.init_cache_engine()
 
