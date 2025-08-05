@@ -677,6 +677,15 @@ class vLLMRollout(BaseRollout):
         if response_attention_mask.shape[1] < self.config.response_length:
             response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
 
+        # left pad the prompt position ids to [bs, config.prompt_length], use '0' to pad
+        prompt_position_ids = pad_sequence(prompt_position_ids, batch_first=True, padding_value=0, padding_side="left")
+        if prompt_position_ids.shape[1] < self.config.prompt_length:
+            prompt_position_ids = pad_sequence_to_length(prompt_position_ids, self.config.prompt_length, 0, left_pad=True)
+        # right pad the response position ids to [bs, config.response_length], use '0' to pad
+        response_length = response_ids.size(1)
+        delta_position_id = torch.arange(1, response_length + 1, device=response_ids.device)
+        delta_position_id = delta_position_id.unsqueeze(0).repeat(len(sorted_output_req_list), 1)
+        response_position_ids = prompt_position_ids[:, -1:] + delta_position_id
         
     async def _async_rollout_a_request(
         self,
