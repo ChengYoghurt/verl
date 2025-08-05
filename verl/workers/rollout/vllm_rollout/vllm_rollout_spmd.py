@@ -609,7 +609,45 @@ class vLLMRollout(BaseRollout):
             src=self._device_mesh_cpu["tp"].mesh[0].item(),
             force_cpu_device=False,
         )
+        # Construct the batch data
+        prompt_ids, response_ids = [], []
+        prompt_attention_mask, response_attention_mask = [], []
+        prompt_position_ids, response_position_ids = [], []
+        prompt_loss_mask, response_loss_mask = [], []
+        messages = []
+        reward_scores = []
+        for req in sorted_output_req_list:
+            assert req.state == AsyncRolloutRequestStateEnum.COMPLETED, f"Request {req.request_id} is not completed"
+            assert len(req.input_ids) == len(req.attention_mask) == len(req.position_ids) == len(req.loss_mask), f"""Request {req.request_id} has different length of 
+                {len(req.input_ids)=}, {len(req.attention_mask)=}, {len(req.position_ids)=}, {len(req.loss_mask)=}"""
+            error_message_lines = [
+                f"""Request {req.request_id} has input_ids length {len(req.input_ids)}
+                    greater than max_model_len {self.config.max_model_len}""",
+                f"Decoded input_ids: {self.processing_class.decode(req.input_ids)}",
+                f"Decoded prompt_ids: {self.processing_class.decode(req.prompt_ids)}",
+                f"Decoded response_ids: {self.processing_class.decode(req.response_ids)}",
+                f"Messages: {req.messages}",
+                f"Max model length: {req.max_model_len}",
+            ]
+            error_message = "\n".join(error_message_lines)
+            assert len(req.input_ids) <= self.config.max_model_len, error_message
 
+            prompt_ids.append(torch.tensor(req.prompt_ids, dtype=torch.int, device=tgt_device))
+            response_ids.append(torch.tensor(req.response_ids, dtype=torch.int, device=tgt_device))
+            if len(req.response_ids) > self.config.response_length:
+                logger.warning(
+                    f"""{req.request_id=} has response_ids length {len(req.response_ids)} 
+                    greater than max_response_len {self.config.response_length},\n{req=}"""
+                )
+            prompt_attention_mask.append(torch.tensor(req.attention_mask[: len(req.prompt_ids)], dtype=torch.int, device=tgt_device))
+            response_attention_mask.append(torch.tensor(req.attention_mask[len(req.prompt_ids) :], dtype=torch.int, device=tgt_device))
+            prompt_position_ids.append(torch.tensor(req.position_ids[: len(req.prompt_ids)], dtype=torch.int, device=tgt_device))
+            response_position_ids.append(torch.tensor(req.position_ids[len(req.prompt_ids) :], dtype=torch.int, device=tgt_device))
+            prompt_loss_mask.append(torch.tensor(req.loss_mask[: len(req.prompt_ids)], dtype=torch.int, device=tgt_device))
+            response_loss_mask.append(torch.tensor(req.loss_mask[len(req.prompt_ids) :], dtype=torch.int, device=tgt_device))
+            messages.append({"messages": req.messages})
+            reward_scores.append(req.reward_scores)
+            
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
