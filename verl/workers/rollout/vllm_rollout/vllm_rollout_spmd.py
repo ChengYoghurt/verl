@@ -38,6 +38,7 @@ import torch.distributed
 from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.nn.utils.rnn import pad_sequence
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
@@ -648,7 +649,20 @@ class vLLMRollout(BaseRollout):
             messages.append({"messages": req.messages})
             reward_scores.append(req.reward_scores)
         
-    
+        # left pad the prompt ids to [bs, config.prompt_length]
+        prompt_ids = pad_sequence(
+            prompt_ids,
+            batch_first=True,
+            padding_value=self.pad_token_id,
+            padding_side="left",
+        )
+        if prompt_ids.shape[1] < self.config.prompt_length:
+            prompt_ids = pad_sequence_to_length(prompt_ids, self.config.prompt_length, self.pad_token_id, left_pad=True)
+        # right pad the response ids to [bs, config.response_length]
+        response_ids = pad_sequence(response_ids, batch_first=True, padding_value=self.pad_token_id)
+        if response_ids.shape[1] < self.config.response_length:
+            response_ids = pad_sequence_to_length(response_ids, self.config.response_length, self.pad_token_id)
+
 
     async def _async_rollout_a_request(
         self,
