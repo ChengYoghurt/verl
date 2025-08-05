@@ -686,7 +686,36 @@ class vLLMRollout(BaseRollout):
         delta_position_id = torch.arange(1, response_length + 1, device=response_ids.device)
         delta_position_id = delta_position_id.unsqueeze(0).repeat(len(sorted_output_req_list), 1)
         response_position_ids = prompt_position_ids[:, -1:] + delta_position_id
+
+        # left pad the prompt loss mask to [bs, config.prompt_length], use '0' to pad
+        prompt_loss_mask = pad_sequence(prompt_loss_mask, batch_first=True, padding_value=0, padding_side="left")
+        if prompt_loss_mask.shape[1] < self.config.prompt_length:
+            prompt_loss_mask = pad_sequence_to_length(prompt_loss_mask, self.config.prompt_length, 0, left_pad=True)
+        # right pad the response loss mask to [bs, config.response_length], use '0' to pad
+        response_loss_mask = pad_sequence(response_loss_mask, batch_first=True, padding_value=0)
+        if response_loss_mask.shape[1] < self.config.response_length:
+            response_loss_mask = pad_sequence_to_length(response_loss_mask, self.config.response_length, 0)
         
+        input_ids = torch.cat((prompt_ids, response_ids), dim=-1)
+        attention_mask = torch.cat((prompt_attention_mask, response_attention_mask), dim=-1)
+        position_ids = torch.cat((prompt_position_ids, response_position_ids), dim=-1)
+        loss_mask = torch.cat((prompt_loss_mask, response_loss_mask), dim=-1)
+        
+        # Construct the batch data
+        batch = TensorDict(
+            {
+                "prompts": prompt_ids,
+                "responses": response_ids,
+                "input_ids": input_ids,  # here input_ids become the whole sentences
+                "attention_mask": attention_mask,
+                "position_ids": position_ids,
+                "loss_mask": loss_mask,
+            },
+            batch_size=len(sorted_output_req_list),
+        )
+
+        
+
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
