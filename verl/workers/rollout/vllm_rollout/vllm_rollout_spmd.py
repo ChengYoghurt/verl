@@ -600,6 +600,15 @@ class vLLMRollout(BaseRollout):
             sorted_output_req_list = sorted(output_req_list, key=lambda x: (x.batch_data_id, x.rollout_offset))
         else:
             sorted_output_req_list = None
+        
+        dist.barrier()
+        [sorted_output_req_list] = broadcast_pyobj(
+            data=[sorted_output_req_list],
+            rank=self._rank,
+            dist_group=self._device_mesh_cpu["tp"].get_group(),
+            src=self._device_mesh_cpu["tp"].mesh[0].item(),
+            force_cpu_device=False,
+        )
 
     async def _async_rollout_a_request(
         self,
