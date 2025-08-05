@@ -589,7 +589,7 @@ class vLLMRollout(BaseRollout):
         if self._tp_rank == 0:
             req_list = self._preprocess_prompt_to_async_rollout_requests(
                 prompts,
-                n=1 if is_validate else self.config.n, # TODO
+                n=1 if is_validate else self.sampling_params.n > 1,
             )
             loop = asyncio.get_event_loop()
             output_req_list = loop.run_until_complete(
