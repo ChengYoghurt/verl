@@ -87,7 +87,7 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
 
 
 class vLLMRollout(BaseRollout):
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, port=None, device_mesh: DeviceMesh | None = None, **kwargs):
+    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, device_mesh: DeviceMesh | None = None, **kwargs):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -173,7 +173,7 @@ class vLLMRollout(BaseRollout):
             engine_kwargs["limit_mm_per_prompt"] = {"image": config.get("limit_images")}
 
         is_multi_turn = config.actor_rollout_ref.rollout.multi_turn.enable if hasattr(config, "actor_rollout_ref") and hasattr(config.actor_rollout_ref, "rollout") else False
-        self._init_inference_engine(is_multi_turn, trust_remote_code, model_path, **lora_kwargs, **engine_kwargs, port)
+        self._init_inference_engine(is_multi_turn, trust_remote_code, model_path, **lora_kwargs, **engine_kwargs)
 
         self._init_sampling_params(**kwargs)
 
@@ -203,7 +203,7 @@ class vLLMRollout(BaseRollout):
         self.visible_devices_set = set(",".join(visible_devices).split(","))
         os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(sorted(list(self.visible_devices_set)))
 
-    def _init_inference_engine(self, is_multi_turn, trust_remote_code, model_path, **lora_kwargs, **engine_kwargs, port):
+    def _init_inference_engine(self, is_multi_turn, trust_remote_code, model_path, **lora_kwargs, **engine_kwargs):
         # prepare inference engine args
         max_model_len = int(self.config.max_model_len or self.config.prompt_length + self.config.response_length)
         load_format = "dummy" if self.config.load_format.startswith("dummy") else self.config.load_format
