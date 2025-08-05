@@ -663,7 +663,21 @@ class vLLMRollout(BaseRollout):
         if response_ids.shape[1] < self.config.response_length:
             response_ids = pad_sequence_to_length(response_ids, self.config.response_length, self.pad_token_id)
 
+        # left pad the prompt attn_mask to [bs, config.prompt_length], use '0' to pad
+        prompt_attention_mask = pad_sequence(
+            prompt_attention_mask,
+            batch_first=True,
+            padding_value=0,
+            padding_side="left",
+        )
+        if prompt_attention_mask.shape[1] < self.config.prompt_length:
+            prompt_attention_mask = pad_sequence_to_length(prompt_attention_mask, self.config.prompt_length, 0, left_pad=True)
+        # right pad the response attn_mask to [bs, config.response_length], use '0' to pad
+        response_attention_mask = pad_sequence(response_attention_mask, batch_first=True, padding_value=0)
+        if response_attention_mask.shape[1] < self.config.response_length:
+            response_attention_mask = pad_sequence_to_length(response_attention_mask, self.config.response_length, 0)
 
+        
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
