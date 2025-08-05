@@ -589,7 +589,7 @@ class vLLMRollout(BaseRollout):
         if self._tp_rank == 0:
             req_list = self._preprocess_prompt_to_async_rollout_requests(
                 prompts,
-                n=1 if is_validate else self.sampling_params.n > 1,
+                n=1 if is_validate else self.sampling_params.n,
             )
             loop = asyncio.get_event_loop()
             output_req_list = loop.run_until_complete(
@@ -656,7 +656,7 @@ class vLLMRollout(BaseRollout):
             )
 
         # Update with any additional kwargs
-        update_sampling_params(kwargs)
+        update_sampling_params(**kwargs)
 
         while current_turns < self.config.multi_turn.max_assistant_turns:
             if _req.state == AsyncRolloutRequestStateEnum.PENDING:
