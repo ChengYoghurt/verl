@@ -39,6 +39,8 @@ from omegaconf import DictConfig, OmegaConf
 from tensordict import TensorDict
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from torch.nn.utils.rnn import pad_sequence
+from transformers import PreTrainedTokenizer, PreTrainedTokenizerFast, ProcessorMixin
+
 from vllm import LLM, SamplingParams
 from vllm.distributed import parallel_state as vllm_ps
 from vllm.lora.request import LoRARequest
@@ -88,7 +90,14 @@ def _repeat_interleave(value: Union[torch.Tensor, np.ndarray], repeats: int) -> 
 
 
 class vLLMRollout(BaseRollout):
-    def __init__(self, model_path: str, config: DictConfig, tokenizer, model_hf_config, device_mesh: DeviceMesh | None = None, **kwargs):
+    def __init__(self,
+        model_path: str,
+        config: DictConfig,
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast, ProcessorMixin],
+        model_hf_config,
+        device_mesh: DeviceMesh | None = None,
+        **kwargs,
+        ):
         """A vLLM rollout. It requires the module is supported by the vllm.
 
         Args:
@@ -178,6 +187,7 @@ class vLLMRollout(BaseRollout):
 
         self._init_sampling_params(**kwargs)
 
+        self.processing_class = tokenizer
         self.pad_token_id = tokenizer.pad_token_id
 
     def _init_distributed_env(self, device_mesh_cpu):
