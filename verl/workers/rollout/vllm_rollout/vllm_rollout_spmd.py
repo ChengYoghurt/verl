@@ -294,7 +294,7 @@ class vLLMRollout(BaseRollout):
         kwargs = dict(
             n=1,
             logprobs=0,  # can be set to 0 and let actor to recompute
-            max_tokens=config.response_length,
+            max_tokens=self.config.response_length,
         )
 
         # # we may detokenize the result all together later
@@ -302,9 +302,9 @@ class vLLMRollout(BaseRollout):
             kwargs["detokenize"] = False
 
         # supporting adding any sampling params from the config file
-        for k in config.keys():
+        for k in self.config.keys():
             if hasattr(SamplingParams(), str(k)):
-                kwargs[k] = config.get(k)
+                kwargs[k] = self.config.get(k)
 
         print(f"kwargs: {kwargs}")
         self.sampling_params = SamplingParams(**kwargs)
@@ -647,7 +647,9 @@ class vLLMRollout(BaseRollout):
             response_loss_mask.append(torch.tensor(req.loss_mask[len(req.prompt_ids) :], dtype=torch.int, device=tgt_device))
             messages.append({"messages": req.messages})
             reward_scores.append(req.reward_scores)
-            
+        
+    
+
     async def _async_rollout_a_request(
         self,
         req: AsyncRolloutRequest,
