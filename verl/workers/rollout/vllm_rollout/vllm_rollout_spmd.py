@@ -902,6 +902,18 @@ class vLLMRollout(BaseRollout):
         if current_turns >= self.config.multi_turn.max_assistant_turns:
             finish_reason_type = FinishReasonTypeEnum.STOP
 
+    async def _handle_pending_state(self, _req: AsyncRolloutRequest) -> AsyncRolloutRequest:
+        if _req.tool_schemas is not None:
+            tool_creation_coroutines = []
+            for tool_schema in _req.tool_schemas:
+                tool = self._tool_map[tool_schema.function.name]
+                create_kwargs = _req.tools_kwargs[tool.name].get("create_kwargs", {})
+                tool_creation_coroutines.append(tool.create(_req.request_id, **create_kwargs))
+            await asyncio.gather(*tool_creation_coroutines)
+        if _req.interaction_kwargs:
+            interaction_kwargs = _req.interaction_kwargs
+            await self.interaction.start_interaction(_req.request_id, **interaction_kwargs)
+            
     def _preprocess_prompt_to_async_rollout_requests(self, prompts: DataProto, n: int) -> list[AsyncRolloutRequest]:
         assert "raw_prompt" in prompts.non_tensor_batch, "need data.return_raw_chat=True, due to no official way do parse_messages"
         req_list = []
