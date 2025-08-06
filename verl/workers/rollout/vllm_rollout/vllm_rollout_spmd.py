@@ -93,7 +93,7 @@ class vLLMRollout(BaseRollout):
     def __init__(self,
         model_path: str,
         config: DictConfig,
-        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast, ProcessorMixin],
+        tokenizer: Union[PreTrainedTokenizer, PreTrainedTokenizerFast],
         model_hf_config,
         device_mesh: DeviceMesh | None = None,
         **kwargs,
